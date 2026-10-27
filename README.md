@@ -41,6 +41,7 @@ Want to see what it would do first? Run `gh sakuen init --dry-run`. Add `--yes` 
 | `gh sakuen restart` | Restart without rebuilding |
 | `gh sakuen rollback` | Go back to the previous version |
 | `gh sakuen sync` | Copy values from `.env` into GitHub secrets, send them to the app, then redeploy |
+| `gh sakuen delete` | Permanently remove the app. You type its subdomain to confirm. Frees the subdomain and your app slot. Your repo is untouched. |
 | `gh sakuen watch` | Follow your deploy request again, for example after fixing a `failed` one |
 
 Each command runs your repo's **Sakuen deploy** workflow and prints its result, so everything also shows up in your repo's **Actions** tab.

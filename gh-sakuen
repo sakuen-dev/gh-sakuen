@@ -28,6 +28,7 @@ Run inside a clone of a $ORG repo.
   gh sakuen restart    Restart without rebuilding
   gh sakuen rollback   Go back to the previous version
   gh sakuen sync       Send secrets from .env to the app, then redeploy
+  gh sakuen delete     Permanently remove the app, freeing its subdomain and your app slot
 
 Flags for init: --yes (accept every suggestion), --dry-run (show what would happen, change nothing)
 
@@ -162,8 +163,11 @@ on:
     inputs:
       action:
         type: choice
-        options: [deploy, sync-env, status, logs, restart, rollback]
+        options: [deploy, sync-env, status, logs, restart, rollback, delete]
         default: status
+      confirm:
+        description: Only for delete. Type your app's subdomain.
+        required: false
 permissions:
   id-token: write
   contents: read
@@ -173,13 +177,15 @@ jobs:
     steps:
       - name: $STEP_NAME
         env:
-          ACTION: \${{ inputs.action }}$env_block
+          ACTION: \${{ inputs.action }}
+          CONFIRM: \${{ inputs.confirm }}$env_block
         run: |
           set -euo pipefail
           TOKEN=\$(curl -sSf -H "Authorization: bearer \$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \\
             "\$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sakuen-deploy-bot" | jq -r .value)
           BODY='{}'
           [[ "\$ACTION" == sync-env ]] && BODY=\$(jq -n '{values: {$values}}')
+          [[ "\$ACTION" == delete ]] && BODY=\$(jq -n --arg c "\$CONFIRM" '{confirm: \$c}')
           curl -sS --fail-with-body -X POST "$BOT_URL/\${ACTION/sync-env/env}" \\
             -H "Authorization: Bearer \$TOKEN" -H "Content-Type: application/json" -d "\$BODY" \\
             | jq -r 'if type == "object" and has("logs") then .logs else . end'
@@ -382,11 +388,13 @@ cmd_watch() {
 }
 
 run_action() {
+  # run_action <action> [extra -f key=value ...]
   local action="$1" out run_id="" started tries=0 rc=0
+  shift
   [[ -n "$(gh api "repos/$REPO/contents/$WORKFLOW_PATH?ref=$DEFAULT_BRANCH" --jq .sha 2>/dev/null)" ]] \
     || die "$WORKFLOW_PATH is not on $DEFAULT_BRANCH yet. Run 'gh sakuen init', or push the file."
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  out="$(gh workflow run "$WORKFLOW_FILE" -R "$REPO" --ref "$DEFAULT_BRANCH" -f action="$action" 2>&1)" \
+  out="$(gh workflow run "$WORKFLOW_FILE" -R "$REPO" --ref "$DEFAULT_BRANCH" -f action="$action" "$@" 2>&1)" \
     || die "could not start the workflow: $out"
   run_id="$(grep -oE 'runs/[0-9]+' <<<"$out" | head -1 | cut -d/ -f2 || true)"
   while [[ -z "$run_id" ]] && (( tries < 30 )); do
@@ -435,6 +443,32 @@ cmd_sync() {
   fi
 }
 
+request_subdomain() {
+  local number="$1"
+  gh issue view "$number" -R "$INFRA" --json body --jq .body \
+    | awk '/^### Subdomain/ { grab = 1; next } grab && NF { print; exit }' | tr -d '[:space:]'
+}
+
+cmd_delete() {
+  repo_info
+  [[ -r /dev/tty ]] || die "delete needs you at the keyboard to type the confirmation"
+  grep -q 'delete' "$WORKFLOW_PATH" 2>/dev/null \
+    || die "your workflow has no delete action yet. Run 'gh sakuen init' to update it, or copy the template: $GUIDE#redeploying"
+  local number sub typed
+  number="$(latest_request)"
+  sub="$( [[ -n "$number" ]] && request_subdomain "$number" || true)"
+  say "This permanently removes ${sub:+https://$sub.$ZONE}${sub:-the app linked to $REPO}, along with any files it stored."
+  say "Your repo and code are not touched. To bring the app back later, open a new deploy request."
+  read -r -p "Type the subdomain to confirm: " typed </dev/tty || true
+  [[ -n "$typed" ]] || die "nothing typed, nothing deleted"
+  if [[ -n "$sub" && "$typed" != "$sub" ]]; then
+    die "that doesn't match '$sub'. Nothing deleted."
+  fi
+  run_action delete -f confirm="$typed"
+  say ""
+  say "Deleted. The subdomain is free, and your deploy request was closed with a note for the owner."
+}
+
 main() {
   local cmd="${1:-help}"
   [[ $# -gt 0 ]] && shift
@@ -452,6 +486,7 @@ main() {
     watch) cmd_watch "${args[@]+"${args[@]}"}" ;;
     deploy|status|logs|restart|rollback) cmd_action "$cmd" ;;
     sync) cmd_sync ;;
+    delete) cmd_delete ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;
   esac
