@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+# gh sakuen: deploy and manage sakuen-dev apps from the terminal.
+set -euo pipefail
+
+ORG="sakuen-dev"
+INFRA="sakuen-dev/infra"
+ZONE="sakuen.org"
+BOT_URL="https://deploy-bot.sakuen.org"
+WORKFLOW_PATH=".github/workflows/sakuen-deploy.yml"
+WORKFLOW_FILE="sakuen-deploy.yml"
+STEP_NAME="Call the Sakuen deploy bot"
+GUIDE="https://github.com/sakuen-dev/infra#readme"
+
+ASSUME_YES=0
+DRY_RUN=0
+
+usage() {
+  cat <<EOF
+gh sakuen: deploy sakuen-dev apps to <name>.$ZONE
+
+Run inside a clone of a $ORG repo.
+
+  gh sakuen init       Set up this repo and open its deploy request
+  gh sakuen watch      Follow the deploy request until the app is live
+  gh sakuen deploy     Rebuild and redeploy from the branch
+  gh sakuen status     Is the app running, and its last 5 deploys
+  gh sakuen logs       Last 200 lines the app printed (private repos only)
+  gh sakuen restart    Restart without rebuilding
+  gh sakuen rollback   Go back to the previous version
+  gh sakuen sync       Send secrets from .env to the app, then redeploy
+
+Flags for init: --yes (accept every suggestion), --dry-run (show what would happen, change nothing)
+
+Guide: $GUIDE
+EOF
+}
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+step() { printf '\n== %s\n' "$*"; }
+
+ask() {
+  # ask VAR "Question" "default"
+  local __var="$1" question="$2" default="${3:-}" reply=""
+  if [[ "$ASSUME_YES" == 1 ]] || [[ ! -r /dev/tty ]]; then
+    printf -v "$__var" '%s' "$default"
+    printf '%s [%s]\n' "$question" "$default"
+    return
+  fi
+  read -r -p "$question [$default]: " reply </dev/tty || true
+  printf -v "$__var" '%s' "${reply:-$default}"
+}
+
+confirm() {
+  # confirm "Question" -> 0 for yes (default yes)
+  local reply=""
+  if [[ "$ASSUME_YES" == 1 ]] || [[ ! -r /dev/tty ]]; then
+    printf '%s [Y/n] y\n' "$1"
+    return 0
+  fi
+  read -r -p "$1 [Y/n]: " reply </dev/tty || true
+  [[ -z "$reply" || "$reply" =~ ^[Yy] ]]
+}
+
+confirm_no() {
+  # confirm_no "Question" -> 0 only on an explicit yes (default no)
+  local reply=""
+  if [[ "$ASSUME_YES" == 1 ]] || [[ ! -r /dev/tty ]]; then
+    printf '%s [y/N] n\n' "$1"
+    return 1
+  fi
+  read -r -p "$1 [y/N]: " reply </dev/tty || true
+  [[ "$reply" =~ ^[Yy] ]]
+}
+
+repo_info() {
+  git rev-parse --show-toplevel >/dev/null 2>&1 || die "not inside a git repo. cd into your project first."
+  cd "$(git rev-parse --show-toplevel)"
+  REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" \
+    || die "this repo has no GitHub remote, or gh is not logged in (run: gh auth login)"
+  [[ "${REPO%%/*}" == "$ORG" ]] || die "$REPO is not in $ORG. Move it into the org first, see $GUIDE#2-move-the-repo-into-the-org"
+  DEFAULT_BRANCH="$(gh repo view "$REPO" --json defaultBranchRef --jq .defaultBranchRef.name)"
+  REPO_NAME="${REPO#*/}"
+}
+
+has_dep() { [[ -f "$1" ]] && grep -qiE "$2" "$1"; }
+
+detect() {
+  PACK="nixpacks"; PORT="3000"; HEALTH="/"; BUILD=""; START=""; DOCKERFILE=""
+  if [[ -f Dockerfile ]]; then
+    PACK="dockerfile"
+    PORT="$(awk 'toupper($1)=="EXPOSE"{print $2; exit}' Dockerfile | cut -d/ -f1)"
+    PORT="${PORT:-3000}"
+    KIND="Dockerfile"
+  elif [[ -f package.json ]]; then
+    KIND="Node"
+    if ! grep -qE '"start"[[:space:]]*:' package.json && grep -qE '"build"[[:space:]]*:' package.json; then
+      local out="dist"
+      has_dep package.json '"react-scripts"' && out="build"
+      KIND="Node site with a build step"
+      BUILD="npm run build"
+      START="npx --yes serve -s $out -l 3000"
+    fi
+  elif [[ -f requirements.txt || -f pyproject.toml ]]; then
+    KIND="Python"; PORT="8000"
+    local deps module="app"
+    deps="$(cat requirements.txt pyproject.toml 2>/dev/null || true)"
+    [[ -f main.py && ! -f app.py ]] && module="main"
+    if grep -qi fastapi <<<"$deps"; then
+      START="uvicorn $module:app --host 0.0.0.0 --port 8000"
+    elif grep -qi django <<<"$deps"; then
+      local wsgi
+      wsgi="$(find . -maxdepth 2 -name wsgi.py -not -path './.venv/*' | head -1)"
+      [[ -n "$wsgi" ]] && START="gunicorn $(basename "$(dirname "$wsgi")").wsgi --bind 0.0.0.0:8000"
+    elif grep -qi flask <<<"$deps"; then
+      START="gunicorn $module:app --bind 0.0.0.0:8000"
+    fi
+  elif [[ -f go.mod || -f Cargo.toml ]]; then
+    KIND="Go or Rust"; PORT="8080"
+  elif [[ -f index.html ]]; then
+    KIND="static site"; PACK="static"; PORT="80"
+  else
+    KIND="unknown"
+  fi
+}
+
+env_names_from_dotenv() {
+  [[ -f .env ]] || return 0
+  sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Z_][A-Z0-9_]*)[[:space:]]*=.*/\2/p' .env \
+    | grep -vxE 'PORT|HOST|NODE_ENV|DEBUG' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+dotenv_value() {
+  # Print the value for $1 from .env without a trailing newline, outer quotes removed.
+  local line value
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=" .env | tail -1)" || return 1
+  value="${line#*=}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+  fi
+  printf '%s' "$value"
+}
+
+workflow_names() {
+  [[ -f "$WORKFLOW_PATH" ]] || return 0
+  sed -nE 's/^[[:space:]]+([A-Z_][A-Z0-9_]*): \$\{\{ secrets\.[A-Z0-9_]+ \}\}.*/\1/p' "$WORKFLOW_PATH" \
+    | grep -vx EXAMPLE_KEY | tr '\n' ' ' | sed 's/ $//'
+}
+
+render_workflow() {
+  local names=("$@") env_block="" values="" n
+  for n in "${names[@]+"${names[@]}"}"; do
+    env_block+=$'\n'"          $n: \${{ secrets.$n }}"
+    values+="${values:+, }$n: env.$n"
+  done
+  cat <<EOF
+name: Sakuen deploy
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        type: choice
+        options: [deploy, sync-env, status, logs, restart, rollback]
+        default: status
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: $STEP_NAME
+        env:
+          ACTION: \${{ inputs.action }}$env_block
+        run: |
+          set -euo pipefail
+          TOKEN=\$(curl -sSf -H "Authorization: bearer \$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \\
+            "\$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sakuen-deploy-bot" | jq -r .value)
+          BODY='{}'
+          [[ "\$ACTION" == sync-env ]] && BODY=\$(jq -n '{values: {$values}}')
+          curl -sS --fail-with-body -X POST "$BOT_URL/\${ACTION/sync-env/env}" \\
+            -H "Authorization: Bearer \$TOKEN" -H "Content-Type: application/json" -d "\$BODY" \\
+            | jq -r 'if type == "object" and has("logs") then .logs else . end'
+EOF
+}
+
+form_field() {
+  printf '### %s\n\n%s\n\n' "$1" "${2:-_No response_}"
+}
+
+set_secrets() {
+  local n value count=0
+  for n in "$@"; do
+    if ! value="$(dotenv_value "$n")" || [[ -z "$value" ]]; then
+      say "  $n: not in .env, skipped. Add it in GitHub: Settings, Secrets and variables, Actions."
+      continue
+    fi
+    # Value goes through stdin so it never shows up in the process list.
+    gh secret set "$n" --repo "$REPO" < <(printf '%s' "$value") >/dev/null
+    say "  $n: set"
+    count=$((count + 1))
+  done
+  SECRETS_SET="$count"
+}
+
+latest_request() {
+  gh issue list -R "$INFRA" --label deploy-request --state all --search "\"$REPO\" in:body" \
+    --json number,labels \
+    --jq '(map(select(.labels | map(.name) | index("deployed"))) | sort_by(.number) | last) // (sort_by(.number) | last) | .number // empty' 2>/dev/null
+}
+
+cmd_init() {
+  repo_info
+  local sub names_line names=() auto="No" write_wf=1
+
+  step "Checking $REPO"
+  local existing
+  existing="$(latest_request)"
+  if [[ -n "$existing" ]]; then
+    say "This repo already has a deploy request: https://github.com/$INFRA/issues/$existing"
+    confirm "Open another one anyway?" || { say "Run 'gh sakuen watch' to follow it."; exit 0; }
+  fi
+  [[ "$(gh repo view "$REPO" --json isPrivate --jq .isPrivate)" == "true" ]] \
+    || say "Note: the repo is public. 'gh sakuen logs' only works on private repos."
+
+  detect
+  say "Looks like: $KIND"
+  ask PACK "Build pack (nixpacks, railpack, static, dockerfile)" "$PACK"
+  [[ "$PACK" =~ ^(nixpacks|railpack|static|dockerfile)$ ]] || die "build pack must be nixpacks, railpack, static or dockerfile"
+  if [[ "$PACK" == static ]]; then
+    PORT="80"
+  else
+    ask PORT "Port your app listens on" "$PORT"
+    ask START "Start command (empty = let the build pack guess)" "$START"
+    ask BUILD "Build command (empty = default)" "$BUILD"
+  fi
+  [[ "$PACK" == dockerfile ]] && ask DOCKERFILE "Dockerfile path" "Dockerfile"
+  ask HEALTH "Path that returns HTTP 200 when the app is up" "$HEALTH"
+  sub="$(tr '[:upper:]_' '[:lower:]-' <<<"$REPO_NAME" | tr -cd 'a-z0-9-')"
+  ask sub "Subdomain (becomes <subdomain>.$ZONE)" "$sub"
+  if confirm_no "Redeploy automatically on every push to $DEFAULT_BRANCH? (no = you run 'gh sakuen deploy')"; then
+    auto="Yes"
+  fi
+
+  step "Environment variables"
+  if [[ -f .env ]]; then
+    say "Found .env. Values stay on your machine and in GitHub secrets, never in the request."
+  else
+    say "No .env file. List the names your app reads, or leave empty."
+  fi
+  ask names_line "Variable names to send (space-separated)" "$(env_names_from_dotenv)"
+  # shellcheck disable=SC2206
+  names=($names_line)
+  local n
+  for n in "${names[@]+"${names[@]}"}"; do
+    [[ "$n" =~ ^[A-Z_][A-Z0-9_]*$ ]] || die "variable name '$n' must be UPPER_SNAKE_CASE"
+  done
+
+  local body
+  body="$(
+    form_field "Repository" "$REPO"
+    form_field "Branch" "$DEFAULT_BRANCH"
+    form_field "Build pack" "$PACK"
+    form_field "Container port" "$PORT"
+    form_field "Subdomain" "$sub"
+    form_field "Auto-deploy on push" "$auto"
+    form_field "Environment variable names" "$(printf '%s\n' "${names[@]+"${names[@]}"}" | sed '/^$/d')"
+    form_field "Health check path" "$HEALTH"
+    form_field "Install command" ""
+    form_field "Build command" "$BUILD"
+    form_field "Start command" "$START"
+    form_field "Base directory" ""
+    form_field "Publish directory" ""
+    form_field "Dockerfile path" "$DOCKERFILE"
+    form_field "Notes" "Opened with gh sakuen."
+  )"
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    step "Dry run: workflow that would be written to $WORKFLOW_PATH"
+    render_workflow "${names[@]+"${names[@]}"}"
+    step "Dry run: deploy request that would be opened in $INFRA"
+    say "$body"
+    exit 0
+  fi
+
+  step "Workflow"
+  local rendered
+  rendered="$(render_workflow "${names[@]+"${names[@]}"}")"
+  if [[ -f "$WORKFLOW_PATH" ]] && [[ "$(cat "$WORKFLOW_PATH")" == "$rendered" ]]; then
+    say "$WORKFLOW_PATH is already up to date."
+    write_wf=0
+  elif [[ -f "$WORKFLOW_PATH" ]]; then
+    confirm "Replace your existing $WORKFLOW_PATH with one for these variables?" || write_wf=0
+  fi
+  if [[ "$write_wf" == 1 ]]; then
+    mkdir -p "$(dirname "$WORKFLOW_PATH")"
+    printf '%s\n' "$rendered" >"$WORKFLOW_PATH"
+    say "Wrote $WORKFLOW_PATH"
+    local branch
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    if [[ "$branch" != "$DEFAULT_BRANCH" ]]; then
+      say "You're on '$branch'. The workflow only works once it's on '$DEFAULT_BRANCH', so commit and push it there yourself."
+    elif confirm "Commit and push it to $DEFAULT_BRANCH now?"; then
+      git add "$WORKFLOW_PATH"
+      git commit -q -m "ci: add Sakuen deploy workflow" -- "$WORKFLOW_PATH"
+      git push -q origin "$DEFAULT_BRANCH"
+      say "Pushed."
+    else
+      say "Commit and push $WORKFLOW_PATH to $DEFAULT_BRANCH before deploying."
+    fi
+  fi
+
+  if [[ ${#names[@]} -gt 0 ]]; then
+    step "Secrets"
+    if confirm "Copy the values for ${names[*]} from .env into this repo's GitHub secrets?"; then
+      set_secrets "${names[@]}"
+    else
+      say "Add them yourself: Settings, Secrets and variables, Actions, New repository secret."
+    fi
+  fi
+
+  step "Deploy request"
+  local url
+  url="$(gh issue create -R "$INFRA" --title "deploy: $REPO_NAME" --label deploy-request --body "$body")"
+  say "Opened $url"
+  say ""
+  say "The bot answers within a minute. Following it now (Ctrl-C to stop, 'gh sakuen watch' to resume)."
+  watch_issue "${url##*/}"
+}
+
+issue_labels() {
+  gh issue view "$1" -R "$INFRA" --json labels --jq '[.labels[].name] | join(" ")'
+}
+
+last_bot_comment() {
+  gh issue view "$1" -R "$INFRA" --json comments \
+    --jq '[.comments[] | select(.author.login | test("deploy-bot"))] | last | .body // ""'
+}
+
+watch_issue() {
+  local number="$1" labels="" seen="" synced=0 deadline=$((SECONDS + 1800))
+  while (( SECONDS < deadline )); do
+    labels=" $(issue_labels "$number") "
+    if [[ "$labels" != "$seen" ]]; then
+      seen="$labels"
+      case "$labels" in
+        *" deployed "*)
+          say ""; last_bot_comment "$number"; say ""
+          say "Done. From now on: gh sakuen deploy | status | logs | restart | rollback"
+          return 0 ;;
+        *" invalid "*|*" failed "*|*" rejected "*)
+          say ""; last_bot_comment "$number"; say ""
+          say "The bot stopped. Fix what it says, then remove the label on https://github.com/$INFRA/issues/$number"
+          say "and run 'gh sakuen watch' again."
+          return 1 ;;
+        *" needs-review "*)
+          say "Flagged for the owner's review. Nothing to do but wait. This keeps watching." ;;
+        *" waiting-secrets "*)
+          if [[ "$synced" == 0 ]]; then
+            say "The app exists and is waiting for its secrets. Sending them now."
+            run_action sync-env || { say "sync-env failed. Check the secrets exist, then run 'gh sakuen sync'."; return 1; }
+            synced=1
+          fi ;;
+        *" deploying "*)
+          say "Building. A first build usually takes 2 to 5 minutes." ;;
+      esac
+    fi
+    sleep 10
+  done
+  say "Still not finished after 30 minutes. Check https://github.com/$INFRA/issues/$number"
+  return 1
+}
+
+cmd_watch() {
+  repo_info
+  local number="${1:-$(latest_request)}"
+  [[ -n "$number" ]] || die "no deploy request found for $REPO. Run 'gh sakuen init'."
+  say "Following https://github.com/$INFRA/issues/$number"
+  watch_issue "$number"
+}
+
+run_action() {
+  local action="$1" out run_id="" started tries=0 rc=0
+  [[ -n "$(gh api "repos/$REPO/contents/$WORKFLOW_PATH?ref=$DEFAULT_BRANCH" --jq .sha 2>/dev/null)" ]] \
+    || die "$WORKFLOW_PATH is not on $DEFAULT_BRANCH yet. Run 'gh sakuen init', or push the file."
+  started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  out="$(gh workflow run "$WORKFLOW_FILE" -R "$REPO" --ref "$DEFAULT_BRANCH" -f action="$action" 2>&1)" \
+    || die "could not start the workflow: $out"
+  run_id="$(grep -oE 'runs/[0-9]+' <<<"$out" | head -1 | cut -d/ -f2 || true)"
+  while [[ -z "$run_id" ]] && (( tries < 30 )); do
+    sleep 2
+    run_id="$(gh run list -R "$REPO" --workflow "$WORKFLOW_FILE" --event workflow_dispatch -L 5 \
+      --json databaseId,createdAt --jq "[.[] | select(.createdAt >= \"$started\")] | last | .databaseId // empty")"
+    tries=$((tries + 1))
+  done
+  [[ -n "$run_id" ]] || die "started '$action' but couldn't find the run. Check the Actions tab."
+  printf 'Running %s ' "$action"
+  gh run watch "$run_id" -R "$REPO" --exit-status >/dev/null 2>&1 || rc=$?
+  printf '\n\n'
+  gh run view "$run_id" -R "$REPO" --log 2>/dev/null \
+    | awk -F'\t' -v step="$STEP_NAME" '$2 == step' | cut -f3- \
+    | awk 'done { sub(/^[^ ]+ /, ""); print } /##\[endgroup\]/ { done = 1 }' \
+    | grep -v '^##\[' || true
+  if [[ "$rc" != 0 ]]; then
+    say ""
+    say "The run failed. Full log: gh run view $run_id -R $REPO --log"
+    return 1
+  fi
+}
+
+cmd_action() {
+  repo_info
+  run_action "$1"
+  case "$1" in
+    deploy) say ""; say "Live in 2 to 5 minutes. Check with: gh sakuen status" ;;
+    restart) say ""; say "Back within a minute. Check with: gh sakuen status" ;;
+  esac
+}
+
+cmd_sync() {
+  repo_info
+  local names=()
+  # shellcheck disable=SC2207
+  names=($(workflow_names))
+  [[ ${#names[@]} -gt 0 ]] || die "your workflow lists no variables. Add names with 'gh sakuen init', or see $GUIDE#secrets-and-environment-variables"
+  [[ -f .env ]] || die "no .env here. Set the secrets in GitHub (Settings, Secrets and variables, Actions), then run 'gh sakuen sync' from a folder with .env, or run the workflow's sync-env."
+  step "Updating GitHub secrets from .env"
+  set_secrets "${names[@]}"
+  step "Sending them to the app"
+  run_action sync-env
+  if confirm "Redeploy now so the app picks them up?"; then
+    run_action deploy
+  fi
+}
+
+main() {
+  local cmd="${1:-help}"
+  [[ $# -gt 0 ]] && shift
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) ASSUME_YES=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  command -v gh >/dev/null || die "GitHub CLI not found"
+  case "$cmd" in
+    init) cmd_init ;;
+    watch) cmd_watch "${args[@]+"${args[@]}"}" ;;
+    deploy|status|logs|restart|rollback) cmd_action "$cmd" ;;
+    sync) cmd_sync ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
